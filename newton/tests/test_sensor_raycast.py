@@ -3,6 +3,7 @@
 
 import math
 import unittest
+import warnings
 
 import numpy as np
 import warp as wp
@@ -12,6 +13,9 @@ from newton.sensors import SensorRaycast
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 EXPORT_IMAGES = False
+
+# SensorRaycast is deprecated; suppress the warning so existing tests stay clean.
+warnings.filterwarnings("ignore", category=DeprecationWarning, message="SensorRaycast is deprecated")
 
 
 def save_depth_image_as_grayscale(depth_image: np.ndarray, filename: str):
@@ -498,6 +502,25 @@ def test_sensor_raycast_ellipsoid(test: unittest.TestCase, device: str):
     test.assertAlmostEqual(float(depth[0, 0]), 4.2, delta=1e-3)
 
 
+def test_sensor_raycast_deprecation_warning(test: unittest.TestCase, device: str):
+    """Constructing SensorRaycast must emit a DeprecationWarning."""
+    builder = newton.ModelBuilder()
+    with wp.ScopedDevice(device):
+        model = builder.finalize()
+    with warnings.catch_warnings():
+        warnings.simplefilter("always", DeprecationWarning)
+        with test.assertWarns(DeprecationWarning):
+            SensorRaycast(
+                model=model,
+                camera_position=(0.0, 0.0, 0.0),
+                camera_direction=(0.0, 0.0, 1.0),
+                camera_up=(0.0, 1.0, 0.0),
+                fov_radians=0.5,
+                width=1,
+                height=1,
+            )
+
+
 class TestSensorRaycast(unittest.TestCase):
     pass
 
@@ -563,6 +586,12 @@ add_function_test(
     TestSensorRaycast,
     "test_sensor_raycast_finite_plane_boundary",
     test_sensor_raycast_finite_plane_boundary,
+    devices=devices,
+)
+add_function_test(
+    TestSensorRaycast,
+    "test_sensor_raycast_deprecation_warning",
+    test_sensor_raycast_deprecation_warning,
     devices=devices,
 )
 
