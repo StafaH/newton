@@ -654,6 +654,52 @@ def _identity_transform(robot_count, device):
     )
 
 
+def test_model_free_preserves_small_singular_direction(test: unittest.TestCase, device):
+    """Preserve the minimum-norm controller solution for mixed-scale Jacobians."""
+    pair = np.zeros((6, 2), dtype=np.float32)
+    pair[:2, :] = [[1.0e4, 1.0e-4], [0.0, 1.0e-4]]
+    redundant = np.zeros((6, 7), dtype=np.float32)
+    redundant[0, 0] = 1.0e4
+    redundant[1, 1] = 6.0e-4
+    redundant[1, 6] = 5.0e-4
+    redundant[2:6, 2:6] = np.eye(4)
+    for jacobian_np, task_dim in ((pair, 2), (redundant, 6)):
+        dofs = jacobian_np.shape[1]
+        error_np = np.zeros(6, dtype=np.float32)
+        error_np[1] = 1.0e-4
+        j64 = jacobian_np.astype(np.float64)
+        expected = np.linalg.pinv(j64) @ error_np.astype(np.float64)
+        for method, options in (
+            (DifferentialIKMethod.DAMPED_LEAST_SQUARES, {"damping": 0.0}),
+            (DifferentialIKMethod.PSEUDO_INVERSE, {"damping": None}),
+            (DifferentialIKMethod.TRUNCATED_SVD, {"damping": None, "truncated_svd_threshold": 1.0e-5}),
+        ):
+            with test.subTest(method=method, dofs=dofs):
+                ctrl = ControllerDifferentialIKModelFree(
+                    controlled_dofs_per_robot=_dofs_arr([dofs], device),
+                    axis_weight=wp.spatial_vector(*([1.0] * task_dim + [0.0] * (6 - task_dim))),
+                    bandwidth=1.0,
+                    ik_method=method,
+                    device=device,
+                    **options,
+                )
+                inputs = ctrl.input()
+                outputs = ctrl.output()
+                inputs.joint_q = wp.zeros(dofs, dtype=wp.float32, device=device)
+                inputs.tool_pose_world = _identity_transform(1, device)
+                inputs.desired_tool_pose_world = wp.array(
+                    [wp.transform(p=wp.vec3(0.0, float(error_np[1]), 0.0), q=wp.quat_identity())],
+                    dtype=wp.transform,
+                    device=device,
+                )
+                inputs.jacobian_tool_world = wp.array3d(jacobian_np[None], dtype=wp.float32, device=device)
+                ctrl.step(inputs=inputs, outputs=outputs, dt=0.01)
+                qd = outputs.joint_qd_target.numpy()
+                # Task error alone cannot distinguish a valid but non-minimum-norm solution.
+                np.testing.assert_allclose(qd, expected, rtol=1.0e-5, atol=1.0e-12)
+                np.testing.assert_allclose(j64 @ qd, error_np, atol=1.0e-9)
+
+
 class TestControllerDifferentialIKModelFree(unittest.TestCase):
     def test_zero_error_gives_zero_velocity(self):
         """When current tool pose equals the target pose exactly, qd_target must be zero."""
@@ -2641,6 +2687,14 @@ def _build_seven_dof_chain_with_tool_site(device):
     builder.add_articulation(joints, label="arm")
     builder.add_site(links[-1], label="tip", xform=wp.transform(p=wp.vec3(0.0, 0.0, 0.2), q=wp.quat_identity()))
     return builder.finalize(device=device)
+
+
+add_function_test(
+    TestControllerDifferentialIKModelFree,
+    "test_model_free_preserves_small_singular_direction",
+    test_model_free_preserves_small_singular_direction,
+    devices=devices,
+)
 
 
 class TestControllerDifferentialIK(unittest.TestCase):
