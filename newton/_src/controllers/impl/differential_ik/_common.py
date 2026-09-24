@@ -709,11 +709,24 @@ def _svd_one_sided_jacobi(A: Any, n_columns: int, tol: Any, max_sweeps: int):
     row0 = type(A[0])()  # length n (column count of A, row count of At)
     col0 = type(at[0])()  # length m (row count of A, column count of At)
     vt = wp.identity(n=type(row0).length, dtype=A.dtype)
+    u_dim = wp.min(n_columns, type(col0).length)
 
-    # Rotations preserve the Frobenius norm, so a column whose norm is below the rounding error of
-    # ``A`` itself is numerically zero, and every pair involving it counts as converged. A matrix with
-    # more columns than rows always ends with such a column; without this, its rounding-level
-    # correlations never drop below ``tol`` and every call runs all ``max_sweeps`` sweeps.
+    # Redundant columns can retain rounding-level correlations after the retained directions have
+    # converged. Ignore exact zero rows, including padding for position-only controller tasks.
+    nonzero_rows = int(0)
+    for row in range(type(col0).length):
+        row_nonzero = bool(False)
+        for column in range(n_columns):
+            if A[row, column] != zero:
+                row_nonzero = True
+        if row_nonzero:
+            nonzero_rows += 1
+    retained_directions = wp.min(n_columns, nonzero_rows)
+
+    # The Frobenius-relative floor identifies candidate retained directions. If too few remain,
+    # a small column may still contain a retained singular direction and must rotate. Otherwise,
+    # scale the deflation floor to the smallest candidate, so redundant columns cannot contribute
+    # appreciable energy to that direction. Rotations preserve the Frobenius norm.
     frobenius_sq = zero
     for i in range(n_columns):
         frobenius_sq += wp.dot(at[i], at[i])
@@ -723,6 +736,16 @@ def _svd_one_sided_jacobi(A: Any, n_columns: int, tol: Any, max_sweeps: int):
     sweeps = int(0)
     for _sweep in range(max_sweeps):
         sweeps += 1
+        significant_columns = int(0)
+        smallest_significant_sq = frobenius_sq
+        for i in range(n_columns):
+            column_sq = wp.dot(at[i], at[i])
+            if column_sq > negligible_sq:
+                significant_columns += 1
+                smallest_significant_sq = wp.min(smallest_significant_sq, column_sq)
+        column_floor = wp.where(
+            significant_columns >= retained_directions, roundoff * roundoff * smallest_significant_sq, zero
+        )
         max_off_diagonal_ratio = zero
         for i in range(n_columns - 1):
             for j in range(i + 1, n_columns):
@@ -731,7 +754,7 @@ def _svd_one_sided_jacobi(A: Any, n_columns: int, tol: Any, max_sweeps: int):
                 alpha = wp.dot(col_i, col_i)
                 beta = wp.dot(col_j, col_j)
                 gamma = wp.dot(col_i, col_j)
-                significant = wp.min(alpha, beta) > negligible_sq
+                significant = wp.min(alpha, beta) > column_floor
                 ratio = wp.where(significant, wp.abs(gamma) / wp.sqrt(alpha * beta), zero)
                 max_off_diagonal_ratio = wp.max(max_off_diagonal_ratio, ratio)
                 if ratio > tol:
@@ -767,7 +790,6 @@ def _svd_one_sided_jacobi(A: Any, n_columns: int, tol: Any, max_sweeps: int):
 
     s_vec = type(row0)()
     ut = wp.identity(n=type(col0).length, dtype=A.dtype)
-    u_dim = wp.min(n_columns, type(col0).length)
     for i in range(u_dim):
         # Repeated argmax selection over the remaining candidates, largest
         # first: also produces s_vec sorted descending, with no separate

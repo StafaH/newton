@@ -22,14 +22,14 @@ from newton.tests.unittest_utils import add_function_test, get_test_devices
 devices = get_test_devices()
 
 
-def _run_svd(a_np, n_columns_vals, device, max_sweeps=30, tol=1.0e-8):
+def _run_svd(a_np, n_columns_vals, device, max_sweeps=30, tol=1.0e-8, dtype=wp.float32):
     """Launch _svd_one_sided_jacobi_kernel on a batch of (m, n) matrices, returning numpy U, S, V."""
     batch, m, n = a_np.shape
-    matrix = wp.array3d(a_np, dtype=wp.float32, device=device).view(wp.types.matrix(shape=(m, n), dtype=wp.float32))
+    matrix = wp.array3d(a_np, dtype=dtype, device=device).view(wp.types.matrix(shape=(m, n), dtype=dtype))
     n_columns = wp.array(n_columns_vals, dtype=wp.int32, device=device)
-    u = wp.zeros((batch, m, m), dtype=wp.float32, device=device).view(wp.types.matrix(shape=(m, m), dtype=wp.float32))
-    s = wp.zeros((batch, n), dtype=wp.float32, device=device).view(wp.types.vector(length=n, dtype=wp.float32))
-    v = wp.zeros((batch, n, n), dtype=wp.float32, device=device).view(wp.types.matrix(shape=(n, n), dtype=wp.float32))
+    u = wp.zeros((batch, m, m), dtype=dtype, device=device).view(wp.types.matrix(shape=(m, m), dtype=dtype))
+    s = wp.zeros((batch, n), dtype=dtype, device=device).view(wp.types.vector(length=n, dtype=dtype))
+    v = wp.zeros((batch, n, n), dtype=dtype, device=device).view(wp.types.matrix(shape=(n, n), dtype=dtype))
     wp.launch(
         _svd_one_sided_jacobi_kernel,
         dim=batch,
@@ -37,7 +37,35 @@ def _run_svd(a_np, n_columns_vals, device, max_sweeps=30, tol=1.0e-8):
         outputs=[u, s, v],
         device=device,
     )
-    return u.view(wp.float32).numpy(), s.view(wp.float32).numpy(), v.view(wp.float32).numpy()
+    return u.view(dtype).numpy(), s.view(dtype).numpy(), v.view(dtype).numpy()
+
+
+def test_svd_one_sided_jacobi_preserves_small_correlated_columns(test: unittest.TestCase, device):
+    """Preserve retained singular directions below a global roundoff threshold."""
+    for dtype, np_dtype, large, small, retained, extra in (
+        (wp.float32, np.float32, 1.0e4, 1.0e-4, 6.0e-4, 5.0e-4),
+        (wp.float64, np.float64, 1.0e16, 0.1, 1.2, 1.0),
+    ):
+        pair = np.array([[large, small], [0.0, small]], dtype=np_dtype)
+        # Several small correlated columns require more than one sweep.
+        block = np.zeros((4, 4), dtype=np_dtype)
+        block[0, 0] = large
+        block[1:, 1:] = small * np.array([[2, 1, 0], [1, 2, 1], [0, 1, 2]])
+        # A redundant column below the global floor can still add significant energy to a retained direction.
+        redundant = np.array([[large, 0.0, 0.0], [0.0, retained, extra]], dtype=np_dtype)
+        # Initially significant columns can collapse into a single direction during a sweep.
+        dependent = np.array([[large, large, small], [0.0, 0.0, small]], dtype=np_dtype)
+        for a_np in (pair, block, np.pad(block, ((0, 0), (0, 1))), redundant, dependent):
+            m, n = a_np.shape
+            with test.subTest(dtype=dtype, shape=a_np.shape):
+                u, s, v = _run_svd(a_np[None], [n], device, tol=1.0e-8, dtype=dtype)
+                expected_s = np.linalg.svd(a_np.astype(np.float64), compute_uv=False)
+                # A relative check retains the small directions; reconstruction alone does not prove convergence.
+                np.testing.assert_allclose(s[0, :m], expected_s, rtol=1.0e-5, atol=0.0)
+                np.testing.assert_allclose(u[0].T @ u[0], np.eye(m), atol=1.0e-5)
+                np.testing.assert_allclose(v[0].T @ v[0], np.eye(n), atol=1.0e-5)
+                reconstruction = (u[0] * s[0, :m]) @ v[0, :, :m].T
+                np.testing.assert_allclose(reconstruction, a_np, rtol=1.0e-5, atol=small * 1.0e-5)
 
 
 def test_svd_one_sided_jacobi_matches_numpy_for_diagonal_matrix(test: unittest.TestCase, device):
@@ -193,6 +221,26 @@ def test_svd_one_sided_jacobi_converges_for_more_columns_than_rows(test: unittes
     np.testing.assert_allclose(s[:, :6], np.linalg.svd(a_np.astype(np.float64), compute_uv=False), atol=1e-4)
 
 
+def test_svd_one_sided_jacobi_converges_with_zero_row_padding(test: unittest.TestCase, device):
+    """Retain convergence for position-only Jacobians with three inactive task rows."""
+    rng = np.random.default_rng(42)
+    a_np = rng.normal(size=(32, 6, 7)).astype(np.float32)
+    a_np[:, 3:, :] = 0.0
+    matrix = wp.array3d(a_np, dtype=wp.float32, device=device).view(wp.types.matrix(shape=(6, 7), dtype=wp.float32))
+    n_columns = wp.full(32, 7, dtype=wp.int32, device=device)
+    sweeps = wp.zeros(32, dtype=wp.int32, device=device)
+    wp.launch(
+        _svd_sweep_count_kernel,
+        dim=32,
+        inputs=[matrix, n_columns, _JACOBI_SVD_TOL, _JACOBI_SVD_MAX_SWEEPS],
+        outputs=[sweeps],
+        device=device,
+    )
+    test.assertLessEqual(int(sweeps.numpy().max()), 10)
+    _, s, _ = _run_svd(a_np, [7] * 32, device, tol=float(_JACOBI_SVD_TOL))
+    np.testing.assert_allclose(s[:, :6], np.linalg.svd(a_np.astype(np.float64), compute_uv=False), atol=1e-4)
+
+
 def test_svd_one_sided_jacobi_batch_has_no_cross_talk_with_heterogeneous_n_columns(test: unittest.TestCase, device):
     """Verify two matrices in one batched launch, with different n_columns, match solving each independently.
 
@@ -302,6 +350,12 @@ class TestOneSidedJacobiSvdSolver(unittest.TestCase):
 
 add_function_test(
     TestOneSidedJacobiSvdSolver,
+    "test_svd_one_sided_jacobi_preserves_small_correlated_columns",
+    test_svd_one_sided_jacobi_preserves_small_correlated_columns,
+    devices=devices,
+)
+add_function_test(
+    TestOneSidedJacobiSvdSolver,
     "test_svd_one_sided_jacobi_matches_numpy_for_diagonal_matrix",
     test_svd_one_sided_jacobi_matches_numpy_for_diagonal_matrix,
     devices=devices,
@@ -340,6 +394,12 @@ add_function_test(
     TestOneSidedJacobiSvdSolver,
     "test_svd_one_sided_jacobi_converges_for_more_columns_than_rows",
     test_svd_one_sided_jacobi_converges_for_more_columns_than_rows,
+    devices=devices,
+)
+add_function_test(
+    TestOneSidedJacobiSvdSolver,
+    "test_svd_one_sided_jacobi_converges_with_zero_row_padding",
+    test_svd_one_sided_jacobi_converges_with_zero_row_padding,
     devices=devices,
 )
 add_function_test(
