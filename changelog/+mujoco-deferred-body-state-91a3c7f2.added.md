@@ -1,0 +1,1 @@
+Add `SolverMuJoCo.step(..., update_body_state=False)` to defer body forward kinematics across intermediate MuJoCo Warp substeps without body-state consumers, while retaining joint-state updates and the default complete-state publication.

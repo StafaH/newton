@@ -970,6 +970,19 @@ same three-phase cycle:
    Kinematic roots pass through unchanged from ``state_in`` (see
    `Kinematic links and fixed roots`_).
 
+For intermediate MuJoCo Warp substeps that have no body-state consumers,
+``solver.step(..., update_body_state=False)`` skips forward kinematics of the
+output bodies. Joint coordinates and velocities still advance, including the
+normal joint-state synchronization on the next step. ``State.body_q`` and
+``State.body_qd`` remain unchanged until a step with the default
+``update_body_state=True`` or an explicit :func:`~newton.eval_fk` call.
+Use the default before collision detection, body-dependent controls, sensors,
+rendering, or other consumers read those arrays. Deferred publication requires
+native MuJoCo collision detection and rejects body/contact observables and the
+MuJoCo CPU backend. This option controls runtime publication only; it has no
+USD-authored equivalent. The default continues to publish the complete state
+on every step.
+
 Request ``CONTACT_F`` with ``solver.observables(..., contacts=contacts)`` and pass
 the container to ``solver.step(..., observables=observables)``. Forces are written
 to ``observables.contact_f``; with ``use_mujoco_contacts=True``, the step also

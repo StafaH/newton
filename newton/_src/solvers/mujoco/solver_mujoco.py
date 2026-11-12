@@ -5078,6 +5078,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         dt: float,
         *,
         observables: SolverBase.Observables | None = None,
+        update_body_state: bool = True,
     ) -> None:
         """Advance the simulation by one timestep.
 
@@ -5130,7 +5131,30 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             dt: Timestep in seconds.
             observables: Optional solver observable arrays allocated by
                 :meth:`observables`.
+            update_body_state: Whether to publish integrated body poses and velocities
+                through forward kinematics. Defaults to ``True``. Set to ``False``
+                only for intermediate MuJoCo Warp substeps with native MuJoCo
+                collision detection and no body/contact observables. Joint coordinates
+                and velocities are still updated, but ``state_out.body_q`` and
+                ``state_out.body_qd`` are left unchanged. Before any body-state
+                consumer runs, finish with a step using the default or call
+                :func:`newton.eval_fk`. This runtime-only option does not change
+                the model or require USD authoring.
         """
+        if not update_body_state:
+            if self.use_mujoco_cpu or not self.mjw_model.opt.run_collision_detection:
+                raise ValueError("Deferred body state requires MuJoCo Warp with native MuJoCo contacts.")
+            body_observables = (
+                self.ObservableKind.BODY_QDD,
+                self.ObservableKind.BODY_PARENT_F,
+                self.ObservableKind.CONTACT_F,
+            )
+            if (
+                state_out.body_qdd is not None
+                or state_out.body_parent_f is not None
+                or (observables is not None and any(observables.is_requested(kind) for kind in body_observables))
+            ):
+                raise ValueError("Deferred body state does not support body or contact observables.")
         self.validate_observables(observables, contacts)
         self._require_unreduced_contacts(contacts)
         if self._use_speculative_contacts and (not math.isfinite(dt) or dt <= 0.0):
@@ -5188,7 +5212,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mjw_data.overflow.zero_()
                 self._mujoco_warp_step()
                 self._update_newton_state(
-                    self.model, state_out, self.mjw_data, state_prev=state_in, observables=observables
+                    self.model,
+                    state_out,
+                    self.mjw_data,
+                    state_prev=state_in,
+                    observables=observables,
+                    update_body_state=update_body_state,
                 )
                 if observables is not None and observables.is_requested(self.ObservableKind.OVERFLOW):
                     # Pipeline overflow is relevant only when Newton supplies collision input.
@@ -6613,6 +6642,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         mj_data: MjWarpData | MjData,
         state_prev: State,
         observables: SolverBase.Observables | None = None,
+        *,
+        update_body_state: bool = True,
     ):
         """Update a Newton state from MuJoCo coordinates and kinematics.
 
@@ -6669,7 +6700,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=model.device,
         )
 
-        eval_fk(model, state.joint_q, state.joint_qd, state)
+        if update_body_state:
+            eval_fk(model, state.joint_q, state.joint_qd, state)
 
         if is_mjwarp:
             self._update_body_observables(model, state, mj_data, observables)

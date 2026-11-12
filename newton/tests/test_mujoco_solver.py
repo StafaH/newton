@@ -1007,6 +1007,87 @@ class TestMuJoCoSolverMassProperties(_MuJoCoSolverPropertiesFixture, unittest.Te
 
 
 class TestMuJoCoSolverGraphCapture(unittest.TestCase):
+    def test_deferred_body_state_matches_full_substeps_and_masked_reset(self):
+        """Joint integration continues while body publication waits for the final substep, including after reset."""
+        if wp.get_cuda_device_count() == 0:
+            self.skipTest("Deferred body state requires MuJoCo Warp on CUDA")
+
+        with wp.ScopedDevice(wp.get_cuda_device(0)):
+            template = newton.ModelBuilder()
+            root = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            root_joint = template.add_joint_free(root)
+            child = template.add_link(mass=0.2, inertia=wp.mat33(np.eye(3)))
+            child_joint = template.add_joint_revolute(
+                root, child, parent_xform=wp.transform((0.0, 0.5, 0.0), wp.quat_identity())
+            )
+            template.add_articulation([root_joint, child_joint])
+            builder = newton.ModelBuilder()
+            for _ in range(2):
+                builder.add_world(template)
+            model = builder.finalize()
+            reference_solver = SolverMuJoCo(model, use_mujoco_contacts=True)
+            deferred_solver = SolverMuJoCo(model, use_mujoco_contacts=True)
+            reference, deferred = model.state(), model.state()
+            control = model.control()
+            control.joint_f.fill_(0.1)
+            for state in (reference, deferred):
+                newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+                state.body_f.fill_(wp.spatial_vector(0.2, 0.0, 0.1, 0.0, 0.1, 0.0))
+
+            # A deferred step must leave body buffers untouched while advancing joint state.
+            previous_body = deferred.body_q.numpy().copy()
+            previous_velocity = deferred.body_qd.numpy().copy()
+            previous_joints = deferred.joint_q.numpy().copy()
+            deferred_solver.step(deferred, deferred, control, None, 0.005, update_body_state=False)
+            reference_solver.step(reference, reference, control, None, 0.005)
+            np.testing.assert_array_equal(deferred.body_q.numpy(), previous_body)
+            np.testing.assert_array_equal(deferred.body_qd.numpy(), previous_velocity)
+            self.assertGreater(np.max(np.abs(deferred.joint_q.numpy() - previous_joints)), 0.0)
+
+            # Exercise both eager and captured loops without duplicating the model setup.
+            for substeps, captured in ((2, False), (4, True)):
+
+                def advance(substeps=substeps):
+                    for substep in range(substeps):
+                        reference_solver.step(reference, reference, control, None, 0.005)
+                        deferred_solver.step(
+                            deferred, deferred, control, None, 0.005, update_body_state=substep == substeps - 1
+                        )
+
+                if captured:
+                    with wp.ScopedCapture() as capture:
+                        advance()
+                for _ in range(3):
+                    if captured:
+                        wp.capture_launch(capture.graph)
+                    else:
+                        advance()
+                    for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                        np.testing.assert_allclose(
+                            getattr(deferred, name).numpy(), getattr(reference, name).numpy(), atol=1e-6
+                        )
+
+            # Reset one world between a deferred substep and final body publication.
+            mask = wp.array([True, False, False], dtype=wp.bool)
+            reference_solver.step(reference, reference, control, None, 0.005)
+            deferred_solver.step(deferred, deferred, control, None, 0.005, update_body_state=False)
+            reference_solver.reset(reference, world_mask=mask)
+            deferred_solver.reset(deferred, world_mask=mask)
+            reference_solver.step(reference, reference, control, None, 0.005)
+            deferred_solver.step(deferred, deferred, control, None, 0.005)
+            for name in ("joint_q", "joint_qd", "body_q", "body_qd"):
+                np.testing.assert_allclose(getattr(deferred, name).numpy(), getattr(reference, name).numpy(), atol=1e-6)
+
+            # Incompatible consumers must fail before modifying state.
+            observables = deferred_solver.observables([SolverMuJoCo.ObservableKind.BODY_QDD])
+            with self.assertRaisesRegex(ValueError, "body or contact observables"):
+                deferred_solver.step(
+                    deferred, deferred, control, None, 0.005, observables=observables, update_body_state=False
+                )
+            deferred_solver.mjw_model.opt.run_collision_detection = False
+            with self.assertRaisesRegex(ValueError, "native MuJoCo contacts"):
+                deferred_solver.step(deferred, deferred, control, None, 0.005, update_body_state=False)
+
     def test_raw_solreflimit_validation_is_deferred_during_capture(self):
         """Defer RAW solreflimit warnings until an eager update after capture and replay."""
         if wp.get_cuda_device_count() == 0:
