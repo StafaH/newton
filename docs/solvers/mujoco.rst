@@ -52,7 +52,7 @@ For example, freeze shape properties while retaining mass and actuator randomiza
 
    solver = newton.solvers.SolverMuJoCo(model)
    # Finish any application-specific property authoring and notifications first.
-   shared_fields = solver.share_model_fields(newton.ModelFlags.SHAPE_PROPERTIES)
+   shared_fields = solver.share_model_fields(immutable_properties=newton.ModelFlags.SHAPE_PROPERTIES)
    # Capture the simulation only after sharing changes array shapes and addresses.
    with wp.ScopedCapture(device=model.device) as capture:
        solver.step(state, state, control, contacts, dt)

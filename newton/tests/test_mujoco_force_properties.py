@@ -131,7 +131,7 @@ class TestMuJoCoForceProperties(unittest.TestCase):
             self.skipTest("MuJoCo Warp storage test requires CUDA")
         model = _make_model(worlds=3, device="cuda:0", shapes=True)
         solver = SolverMuJoCo(model)
-        names = solver.share_model_fields(ModelFlags.SHAPE_PROPERTIES)
+        names = solver.share_model_fields(immutable_properties=ModelFlags.SHAPE_PROPERTIES)
         self.assertIn("geom_friction", names)
         self.assertNotIn("body_mass", names)
         model.body_mass.assign(np.array([1, 1, 2, 2, 3, 3], dtype=np.float32))

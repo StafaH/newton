@@ -5826,7 +5826,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             m.bvh_aabb[adr : adr + num] = np.hstack((aabb[:, :3] @ r.T + offset, aabb[:, 3:] @ np.abs(r).T))
 
     def share_model_fields(
-        self, immutable_properties: ModelFlags | int = ModelFlags.ALL & ~ModelFlags.MODEL_PROPERTIES
+        self, *, immutable_properties: ModelFlags | int = ModelFlags.ALL & ~ModelFlags.MODEL_PROPERTIES
     ) -> tuple[str, ...]:
         """Share exactly uniform MJWarp fields after declaring their properties immutable.
 
