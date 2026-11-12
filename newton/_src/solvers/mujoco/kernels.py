@@ -779,8 +779,13 @@ def _sync_nacon_count(
     last_nacon_count: wp.array[wp.int32],
     contact_generation: wp.array[wp.int32],
     last_contact_generation: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
 ):
-    """Publish the compacted count and reset scratch storage for the next pass."""
+    """Publish the compacted count and reset scratch storage and per-world overflow."""
+    world = wp.tid()
+    overflow[world] = 0
+    if world != 0:
+        return
     gen = contact_generation[0]
     if gen == last_contact_generation[0]:
         nacon[0] = last_nacon_count[0]

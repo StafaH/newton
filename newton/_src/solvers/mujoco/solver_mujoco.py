@@ -5207,9 +5207,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                             "(MuJoCo Warp does not run its own collision detection)."
                         )
                     self._convert_contacts_to_mjwarp(self.model, state_in, contacts)
-                # Always clear d.overflow before the step so observables.overflow
-                # reflects only the current step (d.overflow uses |= accumulation).
-                self.mjw_data.overflow.zero_()
+                else:
+                    # Newton-contact conversion clears overflow while publishing its count.
+                    self.mjw_data.overflow.zero_()
                 self._mujoco_warp_step()
                 self._update_newton_state(
                     self.model,
@@ -5788,14 +5788,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             block_dim=block_dim,
         )
 
-        # Runs as a separate dim=1 kernel AFTER the main kernel completes so that:
+        # Runs as a separate kernel AFTER the main kernel completes so that:
         #  - the compacted count is complete before publishing it and resetting
         #    the scratch counter, avoiding a separate pre-conversion memset
         #  - last_contact_generation is only updated after ALL threads in the
         #    main kernel have read it (avoids a cross-block race)
         wp.launch(
             _sync_nacon_count,
-            dim=1,
+            dim=self.mjw_data.overflow.size,
             inputs=[
                 self.mjw_data.nacon,
                 self._contact_count,
@@ -5803,6 +5803,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._last_nacon_count,
                 contacts.contact_generation,
                 self._last_contact_generation,
+                self.mjw_data.overflow,
             ],
             device=model.device,
         )
