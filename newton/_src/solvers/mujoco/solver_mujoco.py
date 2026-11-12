@@ -76,6 +76,7 @@ from .kernels import (
     apply_mjc_body_f_kernel,
     apply_mjc_control_kernel,
     apply_mjc_free_joint_f_to_body_f_kernel,
+    apply_mjc_inputs_kernel,
     apply_mjc_qfrc_kernel,
     build_ref_q_kernel,
     capture_actuator_dampratio_kernel,
@@ -6099,23 +6100,77 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # Check if the data is a mujoco_warp Data object
         return hasattr(data, "nworld")
 
+    def _apply_mjw_control(self, model: Model, state: State, control: Control | None, data: MjWarpData):
+        """Transfer independent control rows together, adding free-joint wrenches after body forces."""
+        nworld = data.nworld
+        joints_per_world = model.joint_count // nworld
+        has_control = control is not None
+        has_targets = (
+            has_control and self.mjc_actuator_ctrl_source is not None and self.mjc_actuator_to_newton_idx is not None
+        )
+        target_q = control.joint_target_q if has_control else None
+        target_qd = control.joint_target_qd if has_control else None
+        joint_f = control.joint_f if has_control else None
+        ctrl_ns = getattr(control, "mujoco", None) if has_control else None
+        direct_ctrl = getattr(ctrl_ns, "ctrl", None) if ctrl_ns is not None else None
+        mujoco_attrs = getattr(model, "mujoco", None)
+        dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
+        wp.launch(
+            apply_mjc_inputs_kernel,
+            dim=(nworld, max(data.ctrl.shape[1], joints_per_world, data.xfrc_applied.shape[1])),
+            inputs=[
+                has_targets,
+                has_control,
+                state.body_f is not None,
+                joint_f is not None,
+                self.mjc_actuator_ctrl_source,
+                self.mjc_actuator_to_newton_idx,
+                self.mjc_actuator_to_newton_target_q_idx,
+                self.mjc_actuator_to_target_q_axis_idx,
+                self.mjc_actuator_to_newton_ball_jnt,
+                model.joint_X_c,
+                target_q,
+                target_qd,
+                state.joint_q,
+                direct_ctrl,
+                dof_ref,
+                target_q.shape[0] // nworld if target_q is not None else 0,
+                model.joint_coord_count // nworld,
+                model.joint_dof_count // nworld,
+                direct_ctrl.shape[0] // nworld if direct_ctrl is not None else 0,
+                joints_per_world,
+                joint_f,
+                model.joint_type,
+                model.joint_child,
+                model.body_flags,
+                model.joint_q_start,
+                model.joint_qd_start,
+                model.joint_dof_dim,
+                self.mj_qd_start,
+                self.mjc_body_to_newton,
+                state.body_f,
+                model.body_mass,
+                model.body_world,
+                model.gravity,
+                self.mjw_model.body_gravcomp,
+                self.body_free_qd_start,
+            ],
+            outputs=[data.ctrl, data.qfrc_applied, data.xfrc_applied],
+            device=model.device,
+        )
+
     def _apply_mjc_control(self, model: Model, state: State, control: Control | None, mj_data: MjWarpData | MjData):
         if control is None or control.joint_f is None:
             if state.body_f is None:
                 return
-        is_mjwarp = SolverMuJoCo._data_is_mjwarp(mj_data)
-        single_world_template = False
-        if is_mjwarp:
-            ctrl = mj_data.ctrl
-            qfrc = mj_data.qfrc_applied
-            xfrc = mj_data.xfrc_applied
-            nworld = mj_data.nworld
-        else:
-            single_world_template = self.mj_q_start.shape[0] < model.joint_count
-            ctrl = wp.zeros((1, len(mj_data.ctrl)), dtype=wp.float32, device=model.device)
-            qfrc = wp.zeros((1, len(mj_data.qfrc_applied)), dtype=wp.float32, device=model.device)
-            xfrc = wp.zeros((1, len(mj_data.xfrc_applied)), dtype=wp.spatial_vector, device=model.device)
-            nworld = 1
+        if SolverMuJoCo._data_is_mjwarp(mj_data):
+            self._apply_mjw_control(model, state, control, mj_data)
+            return
+        single_world_template = self.mj_q_start.shape[0] < model.joint_count
+        ctrl = wp.zeros((1, len(mj_data.ctrl)), dtype=wp.float32, device=model.device)
+        qfrc = wp.zeros((1, len(mj_data.qfrc_applied)), dtype=wp.float32, device=model.device)
+        xfrc = wp.zeros((1, len(mj_data.xfrc_applied)), dtype=wp.spatial_vector, device=model.device)
+        nworld = 1
         joints_per_world = (
             model.joint_count // model.world_count if single_world_template else model.joint_count // nworld
         )
@@ -6221,10 +6276,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 ],
                 device=model.device,
             )
-        if not is_mjwarp:
-            mj_data.xfrc_applied = xfrc.numpy()
-            mj_data.ctrl[:] = ctrl.numpy().flatten()
-            mj_data.qfrc_applied[:] = qfrc.numpy()
+        mj_data.xfrc_applied = xfrc.numpy()
+        mj_data.ctrl[:] = ctrl.numpy().flatten()
+        mj_data.qfrc_applied[:] = qfrc.numpy()
 
     def _update_mjc_data(
         self,

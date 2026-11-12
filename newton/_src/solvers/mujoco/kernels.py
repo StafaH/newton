@@ -1509,8 +1509,10 @@ def _target_quat_to_axis_angle(qx: float, qy: float, qz: float, qw: float) -> wp
     return wp.vec3(x, y, z) * (speed / sin_a_2)
 
 
-@wp.kernel
-def apply_mjc_control_kernel(
+@wp.func
+def _apply_mjc_control(
+    world: int,
+    actuator: int,
     mjc_actuator_ctrl_source: wp.array[wp.int32],
     mjc_actuator_to_newton_idx: wp.array[wp.int32],
     mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
@@ -1548,7 +1550,6 @@ def apply_mjc_control_kernel(
 
     For CTRL_DIRECT (source=1), mjc_actuator_to_newton_idx is the ctrl index.
     """
-    world, actuator = wp.tid()
     source = mjc_actuator_ctrl_source[actuator]
     idx = mjc_actuator_to_newton_idx[actuator]
 
@@ -1630,7 +1631,53 @@ def apply_mjc_control_kernel(
 
 
 @wp.kernel
-def apply_mjc_body_f_kernel(
+def apply_mjc_control_kernel(
+    mjc_actuator_ctrl_source: wp.array[wp.int32],
+    mjc_actuator_to_newton_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
+    mjc_actuator_to_target_q_axis_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_ball_jnt: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    mujoco_ctrl: wp.array[wp.float32],
+    dof_ref: wp.array[wp.float32],
+    target_q_per_world: wp.int32,
+    coords_per_world: wp.int32,
+    dofs_per_world: wp.int32,
+    ctrls_per_world: wp.int32,
+    joints_per_world: wp.int32,
+    mj_ctrl: wp.array2d[wp.float32],
+):
+    world, index = wp.tid()
+    _apply_mjc_control(
+        world,
+        index,
+        mjc_actuator_ctrl_source,
+        mjc_actuator_to_newton_idx,
+        mjc_actuator_to_newton_target_q_idx,
+        mjc_actuator_to_target_q_axis_idx,
+        mjc_actuator_to_newton_ball_jnt,
+        joint_X_c,
+        joint_target_q,
+        joint_target_qd,
+        joint_q,
+        mujoco_ctrl,
+        dof_ref,
+        target_q_per_world,
+        coords_per_world,
+        dofs_per_world,
+        ctrls_per_world,
+        joints_per_world,
+        mj_ctrl,
+    )
+
+
+@wp.func
+def _apply_mjc_body_f(
+    world: int,
+    mjc_body: int,
     mjc_body_to_newton: wp.array2d[wp.int32],
     body_flags: wp.array[wp.int32],
     body_f: wp.array[wp.spatial_vector],
@@ -1647,7 +1694,6 @@ def apply_mjc_body_f_kernel(
     index, copies its force, and corrects for body-specific gravity when a
     MuJoCo world contains both local and global bodies.
     """
-    world, mjc_body = wp.tid()
     newton_body = mjc_body_to_newton[world, mjc_body]
     if newton_body < 0 or (body_flags[newton_body] & BodyFlags.KINEMATIC) != 0:
         xfrc_applied[world, mjc_body] = wp.spatial_vector(wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0))
@@ -1666,7 +1712,35 @@ def apply_mjc_body_f_kernel(
 
 
 @wp.kernel
-def apply_mjc_qfrc_kernel(
+def apply_mjc_body_f_kernel(
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_flags: wp.array[wp.int32],
+    body_f: wp.array[wp.spatial_vector],
+    body_mass: wp.array[float],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_gravcomp: wp.array2d[float],
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+):
+    world, index = wp.tid()
+    _apply_mjc_body_f(
+        world,
+        index,
+        mjc_body_to_newton,
+        body_flags,
+        body_f,
+        body_mass,
+        body_world,
+        gravity,
+        body_gravcomp,
+        xfrc_applied,
+    )
+
+
+@wp.func
+def _apply_mjc_qfrc(
+    worldid: int,
+    jntid: int,
     joint_f: wp.array[wp.float32],
     joint_q: wp.array[wp.float32],
     joint_type: wp.array[wp.int32],
@@ -1681,7 +1755,6 @@ def apply_mjc_qfrc_kernel(
     # outputs
     qfrc_applied: wp.array2d[wp.float32],
 ):
-    worldid, jntid = wp.tid()
 
     # Skip loop joints — they have no MuJoCo DOF entries
     qd_i = mj_qd_start[jntid]
@@ -1700,7 +1773,7 @@ def apply_mjc_qfrc_kernel(
     if (body_flags[joint_child[joint_id]] & BodyFlags.KINEMATIC) != 0:
         return
 
-    # Free/DISTANCE joint forces are routed via xfrc_applied in a separate kernel
+    # Free/DISTANCE joint forces are routed via the xfrc_applied body-wrench path
     # to preserve COM-wrench semantics; skip them here.
     if jtype == JointType.FREE or jtype == JointType.DISTANCE:
         return
@@ -1719,7 +1792,43 @@ def apply_mjc_qfrc_kernel(
 
 
 @wp.kernel
-def apply_mjc_free_joint_f_to_body_f_kernel(
+def apply_mjc_qfrc_kernel(
+    joint_f: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    joint_type: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_flags: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joints_per_world: int,
+    mj_qd_start: wp.array[wp.int32],
+    qfrc_applied: wp.array2d[wp.float32],
+):
+    world, index = wp.tid()
+    _apply_mjc_qfrc(
+        world,
+        index,
+        joint_f,
+        joint_q,
+        joint_type,
+        joint_child,
+        body_flags,
+        joint_q_start,
+        joint_qd_start,
+        joint_dof_dim,
+        joint_X_c,
+        joints_per_world,
+        mj_qd_start,
+        qfrc_applied,
+    )
+
+
+@wp.func
+def _apply_mjc_free_joint_f_to_body_f(
+    worldid: int,
+    mjc_body: int,
     mjc_body_to_newton: wp.array2d[wp.int32],
     body_flags: wp.array[wp.int32],
     body_free_qd_start: wp.array[wp.int32],
@@ -1727,7 +1836,6 @@ def apply_mjc_free_joint_f_to_body_f_kernel(
     # outputs
     xfrc_applied: wp.array2d[wp.spatial_vector],
 ):
-    worldid, mjc_body = wp.tid()
     newton_body = mjc_body_to_newton[worldid, mjc_body]
     if newton_body < 0 or (body_flags[newton_body] & BodyFlags.KINEMATIC) != 0:
         return
@@ -1743,6 +1851,121 @@ def apply_mjc_free_joint_f_to_body_f_kernel(
         wp.spatial_top(xfrc) + v,
         wp.spatial_bottom(xfrc) + w,
     )
+
+
+@wp.kernel
+def apply_mjc_free_joint_f_to_body_f_kernel(
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_flags: wp.array[wp.int32],
+    body_free_qd_start: wp.array[wp.int32],
+    joint_f: wp.array[wp.float32],
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+):
+    world, index = wp.tid()
+    _apply_mjc_free_joint_f_to_body_f(
+        world, index, mjc_body_to_newton, body_flags, body_free_qd_start, joint_f, xfrc_applied
+    )
+
+
+@wp.kernel
+def apply_mjc_inputs_kernel(
+    apply_control: bool,
+    apply_joint_force: bool,
+    apply_body_force: bool,
+    apply_free_force: bool,
+    mjc_actuator_ctrl_source: wp.array[wp.int32],
+    mjc_actuator_to_newton_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_target_q_idx: wp.array[wp.int32],
+    mjc_actuator_to_target_q_axis_idx: wp.array[wp.int32],
+    mjc_actuator_to_newton_ball_jnt: wp.array[wp.int32],
+    joint_X_c: wp.array[wp.transform],
+    joint_target_q: wp.array[wp.float32],
+    joint_target_qd: wp.array[wp.float32],
+    joint_q: wp.array[wp.float32],
+    mujoco_ctrl: wp.array[wp.float32],
+    dof_ref: wp.array[wp.float32],
+    target_q_per_world: wp.int32,
+    coords_per_world: wp.int32,
+    dofs_per_world: wp.int32,
+    ctrls_per_world: wp.int32,
+    joints_per_world: wp.int32,
+    joint_f: wp.array[wp.float32],
+    joint_type: wp.array[wp.int32],
+    joint_child: wp.array[wp.int32],
+    body_flags: wp.array[wp.int32],
+    joint_q_start: wp.array[wp.int32],
+    joint_qd_start: wp.array[wp.int32],
+    joint_dof_dim: wp.array2d[wp.int32],
+    mj_qd_start: wp.array[wp.int32],
+    mjc_body_to_newton: wp.array2d[wp.int32],
+    body_f: wp.array[wp.spatial_vector],
+    body_mass: wp.array[float],
+    body_world: wp.array[wp.int32],
+    gravity: wp.array[wp.vec3],
+    body_gravcomp: wp.array2d[float],
+    body_free_qd_start: wp.array[wp.int32],
+    mj_ctrl: wp.array2d[wp.float32],
+    qfrc_applied: wp.array2d[wp.float32],
+    xfrc_applied: wp.array2d[wp.spatial_vector],
+):
+    """Transfer actuator targets and forces in one launch, preserving body-wrench addition order."""
+    world, index = wp.tid()
+    if apply_control and index < mj_ctrl.shape[1]:
+        _apply_mjc_control(
+            world,
+            index,
+            mjc_actuator_ctrl_source,
+            mjc_actuator_to_newton_idx,
+            mjc_actuator_to_newton_target_q_idx,
+            mjc_actuator_to_target_q_axis_idx,
+            mjc_actuator_to_newton_ball_jnt,
+            joint_X_c,
+            joint_target_q,
+            joint_target_qd,
+            joint_q,
+            mujoco_ctrl,
+            dof_ref,
+            target_q_per_world,
+            coords_per_world,
+            dofs_per_world,
+            ctrls_per_world,
+            joints_per_world,
+            mj_ctrl,
+        )
+    if apply_joint_force and index < joints_per_world:
+        _apply_mjc_qfrc(
+            world,
+            index,
+            joint_f,
+            joint_q,
+            joint_type,
+            joint_child,
+            body_flags,
+            joint_q_start,
+            joint_qd_start,
+            joint_dof_dim,
+            joint_X_c,
+            joints_per_world,
+            mj_qd_start,
+            qfrc_applied,
+        )
+    if apply_body_force and index < xfrc_applied.shape[1]:
+        _apply_mjc_body_f(
+            world,
+            index,
+            mjc_body_to_newton,
+            body_flags,
+            body_f,
+            body_mass,
+            body_world,
+            gravity,
+            body_gravcomp,
+            xfrc_applied,
+        )
+    if apply_free_force and index < xfrc_applied.shape[1]:
+        _apply_mjc_free_joint_f_to_body_f(
+            world, index, mjc_body_to_newton, body_flags, body_free_qd_start, joint_f, xfrc_applied
+        )
 
 
 @wp.kernel

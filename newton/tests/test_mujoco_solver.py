@@ -11792,6 +11792,50 @@ class TestMultiWorldQfrcActuatorCom(unittest.TestCase):
         angular_1 = qfrc[dofs_per_world + 3 : dofs_per_world + 6]
         np.testing.assert_allclose(angular_1, [0.3, 1.0, 0.0], atol=0.05)
 
+    def test_control_transfer_combines_wrenches_during_graph_replay(self):
+        """Body and free-joint wrenches add once, with live controls and kinematic masking."""
+        model, solver = self.model, self.solver
+        state, control = model.state(), model.control()
+        original_flags = model.body_flags.numpy().copy()
+        control.mujoco.ctrl = wp.zeros(model.world_count, dtype=wp.float32, device=model.device)
+        mapping = solver.mjc_body_to_newton.numpy()
+
+        def transfer():
+            solver._apply_mjc_control(model, state, control, solver.mjw_data)
+
+        transfer()
+        graph = None
+        if model.device.is_cuda:
+            with wp.ScopedCapture(device=model.device) as capture:
+                transfer()
+            graph = capture.graph
+        try:
+            for iteration in range(3):
+                body_force = np.arange(model.body_count * 6, dtype=np.float32).reshape(-1, 6) + iteration
+                joint_force = np.full((model.body_count, 6), 2.0 - iteration, dtype=np.float32)
+                direct = np.array([1.5 + iteration, -2.0 - iteration], dtype=np.float32)
+                flags = original_flags.copy()
+                if iteration == 2:
+                    flags[1] = int(BodyFlags.KINEMATIC)
+                model.body_flags.assign(flags)
+                state.body_f.assign(body_force)
+                control.joint_f.assign(joint_force.reshape(-1))
+                control.mujoco.ctrl.assign(direct)
+                if graph is None:
+                    transfer()
+                else:
+                    wp.capture_launch(graph)
+                expected = np.zeros_like(solver.mjw_data.xfrc_applied.numpy())
+                for world in range(model.world_count):
+                    for body, index in enumerate(mapping[world]):
+                        if index >= 0 and not flags[index] & int(BodyFlags.KINEMATIC):
+                            expected[world, body] = body_force[index] + joint_force[index]
+                np.testing.assert_array_equal(solver.mjw_data.xfrc_applied.numpy(), expected)
+                np.testing.assert_array_equal(solver.mjw_data.qfrc_applied.numpy(), 0.0)
+                np.testing.assert_array_equal(solver.mjw_data.ctrl.numpy()[:, 0], direct)
+        finally:
+            model.body_flags.assign(original_flags)
+
 
 class TestActuatorLengthRange(unittest.TestCase):
     """Verify that actuator length ranges keep MuJoCo's compiled values."""
