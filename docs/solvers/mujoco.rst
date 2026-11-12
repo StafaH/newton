@@ -33,6 +33,44 @@ section at the bottom collects the most useful anchor points.
    GPU-resident analogues.
 
 
+Shared immutable model storage
+------------------------------
+
+By default, MuJoCo Warp model fields remain independently editable in every world.
+For workloads with immutable properties, call
+:meth:`~newton.solvers.SolverMuJoCo.share_model_fields` after model authoring and
+before capturing simulation graphs. It shares only bitwise-identical world rows;
+nonuniform parameters and fields needed by Newton state, control, and coupling
+operations retain their per-world storage. This reduces repeated model reads without
+changing world-specific values.
+
+.. experimental::
+
+   Shared immutable model storage and its field eligibility rules are experimental.
+
+For example, freeze shape properties while retaining mass and actuator randomization::
+
+   solver = newton.solvers.SolverMuJoCo(model)
+   # Finish any application-specific property authoring and notifications first.
+   shared_fields = solver.share_model_fields(newton.ModelFlags.SHAPE_PROPERTIES)
+   # Capture the simulation only after sharing changes array shapes and addresses.
+   with wp.ScopedCapture(device=model.device) as capture:
+       solver.step(state, state, control, contacts, dt)
+
+Calling without arguments freezes all non-option property categories and permits
+more fields to share storage. Per-world gravity updates through
+``notify_model_changed(ModelFlags.MODEL_PROPERTIES)`` remain supported. Controls,
+state writes, resets, and mocap motion do not become immutable.
+
+Notifications affecting frozen categories raise before changing solver arrays,
+including when recording a graph. Unrelated categories stay editable. Reconstruct
+the solver to edit frozen properties; direct writes to its shared model arrays are
+unsupported. Sharing synchronizes the device and is prohibited during graph capture.
+Applications must discard and recapture any existing graphs themselves: the solver
+cannot discover externally owned graphs. The optimization is runtime-only and does
+not introduce asset-authoring or USD schema settings.
+
+
 Joint types
 -----------
 

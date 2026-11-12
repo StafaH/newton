@@ -4545,6 +4545,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if update_data_interval is not None:
             warnings.warn(_UPDATE_DATA_INTERVAL_DEPRECATION_MSG, NewtonDeprecationWarning, stacklevel=2)
         super().__init__(model)
+        self._immutable_model_properties = 0
+        self._shared_model_fields: tuple[str, ...] = ()
         self._kinematic_switchable_roots = kinematic_switchable_roots
         if use_speculative_contacts and (use_mujoco_contacts or use_mujoco_cpu):
             raise ValueError("use_speculative_contacts=True requires Newton contacts on the MuJoCo Warp backend.")
@@ -5793,8 +5795,119 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # Rotated boxes grow into their enclosing AABB, so always start from the compiled ones.
             m.bvh_aabb[adr : adr + num] = np.hstack((aabb[:, :3] @ r.T + offset, aabb[:, 3:] @ np.abs(r).T))
 
+    def share_model_fields(
+        self, immutable_properties: ModelFlags | int = ModelFlags.ALL & ~ModelFlags.MODEL_PROPERTIES
+    ) -> tuple[str, ...]:
+        """Share exactly uniform MJWarp fields after declaring their properties immutable.
+
+        Call after all model authoring and before capturing simulation graphs. Existing graphs must be
+        discarded and recaptured by the caller; Newton cannot discover graphs owned by applications.
+        This opt-in operation synchronizes the device and changes model array shapes and addresses.
+        Subsequent notifications affecting the declared immutable properties raise before modifying
+        solver arrays, including during capture. Direct writes to the solver's model arrays are unsupported.
+        Reconstruct the solver without sharing to resume authoring those properties.
+
+        Only bitwise-identical world rows are shared. Nonuniform arrays and state-dependent root and
+        equality fields remain batched. Shape properties can be frozen independently; other fields are
+        conservatively eligible only when all non-option property categories are immutable. Global
+        options stay batched, so per-world gravity changes remain supported with MODEL_PROPERTIES.
+        State, controls, resets, and mocap-root motion remain mutable.
+
+        .. experimental::
+            Shared model storage and its eligibility rules may change without a deprecation period.
+
+        Args:
+            immutable_properties: Property notifications to prohibit. Defaults to all categories except
+                MODEL_PROPERTIES. SHAPE_PROPERTIES also freezes SHAPE_TYPE_AND_SOURCE.
+
+        Returns:
+            Names of fields shared by this call, or previously shared by an identical call.
+
+        Raises:
+            RuntimeError: Called during graph capture, with native MuJoCo, or after a different declaration.
+            ValueError: The declaration contains unknown flags or MODEL_PROPERTIES.
+        """
+        if self.model.device.is_capturing:
+            raise RuntimeError("Share model fields before CUDA graph capture, then capture the simulation again.")
+        if self.use_mujoco_cpu:
+            raise RuntimeError("Shared model fields require MuJoCo Warp.")
+        flags = int(immutable_properties)
+        supported = int(ModelFlags.ALL) & ~int(ModelFlags.MODEL_PROPERTIES)
+        if flags < 0 or flags & ~supported:
+            raise ValueError("immutable_properties must contain only non-option ModelFlags categories.")
+        if flags & ModelFlags.SHAPE_PROPERTIES:
+            flags |= ModelFlags.SHAPE_TYPE_AND_SOURCE
+        if flags & ModelFlags.JOINT_DOF_PROPERTIES:
+            flags |= (
+                ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+                | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+                | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
+            )
+        if self._immutable_model_properties:
+            if flags != self._immutable_model_properties:
+                raise RuntimeError("Shared model properties cannot be redeclared; reconstruct the solver.")
+            return self._shared_model_fields
+        # Keep state-dependent fields and arrays read with world indices by Newton coupling/control kernels.
+        state_fields = {"qpos0", "qpos_spring", "body_pos", "body_quat", "eq_data", "body_gravcomp", "body_invweight0"}
+        # No constant-recomputation kernel writes these directly authored shape material/pose fields.
+        shape_fields = {
+            "geom_solmix",
+            "geom_solref",
+            "geom_solimp",
+            "geom_pos",
+            "geom_quat",
+            "geom_friction",
+            "geom_margin",
+            "geom_gap",
+            "site_pos",
+            "site_quat",
+            "pair_solref",
+            "pair_solreffriction",
+            "pair_solimp",
+            "pair_margin",
+            "pair_gap",
+            "pair_friction",
+        }
+        if not self._use_mujoco_contacts:
+            state_fields.update(
+                {"geom_solmix", "geom_solref", "geom_solimp", "geom_friction", "geom_margin", "geom_gap"}
+            )
+        shared = {}
+        for name in _MJW_BATCHED_MODEL_FIELDS:
+            if name in state_fields:
+                continue
+            required = (
+                int(ModelFlags.SHAPE_PROPERTIES | ModelFlags.SHAPE_TYPE_AND_SOURCE)
+                if name in shape_fields
+                else supported
+            )
+            if flags & required != required:
+                continue
+            array = getattr(self.mjw_model, name)
+            if not array.size or array.shape[0] <= 1:
+                continue
+            values = array.numpy().view(np.uint8).reshape(array.shape[0], -1)
+            if np.all(values == values[:1]):
+                shared[name] = wp.clone(array[:1])
+        for name, array in shared.items():
+            setattr(self.mjw_model, name, array)
+        self._immutable_model_properties = flags
+        self._shared_model_fields = tuple(shared)
+        return self._shared_model_fields
+
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
+        affected = int(flags)
+        if affected & ModelFlags.JOINT_DOF_PROPERTIES:
+            affected |= (
+                ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+                | ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES
+                | ModelFlags.JOINT_REFERENCE_POSE_PROPERTIES
+            )
+        if affected & self._immutable_model_properties:
+            raise RuntimeError(
+                "Model notification affects immutable shared properties; reconstruct SolverMuJoCo without sharing. Solver arrays were not updated."
+            )
         if self.use_mujoco_cpu:
             self._notify_model_changed(flags)
         else:

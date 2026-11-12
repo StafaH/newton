@@ -27,7 +27,13 @@ def _publish_budget(values: wp.array[float], friction: wp.array[float], damping:
 
 
 def _make_model(
-    *, worlds: int = 2, dofs: int = 2, device="cpu", custom_attributes: bool = True, driven: bool = False
+    *,
+    worlds: int = 2,
+    dofs: int = 2,
+    device="cpu",
+    custom_attributes: bool = True,
+    driven: bool = False,
+    shapes: bool = False,
 ) -> newton.Model:
     """Build a replicated hinge chain with passive parameters and joint limits."""
     template = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -37,6 +43,8 @@ def _make_model(
     parent = -1
     for _ in range(dofs):
         body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)), com=wp.vec3(0.0))
+        if shapes:
+            template.add_shape_sphere(body, radius=0.1, cfg=newton.ModelBuilder.ShapeConfig(density=0.0))
         joints.append(
             template.add_joint_revolute(
                 parent,
@@ -60,6 +68,81 @@ def _make_model(
 
 
 class TestMuJoCoForceProperties(unittest.TestCase):
+    def test_shared_model_storage_preserves_nonuniform_fields_and_capture(self):
+        """Preserve trajectories and per-world fields while rejecting frozen property writes."""
+        if not wp.is_cuda_available():
+            self.skipTest("CUDA graph capture requires CUDA")
+        device = wp.get_device("cuda:0")
+        model = _make_model(worlds=3, driven=True, device=device)
+        model.joint_damping.assign(np.array([0.2, 0.2, 0.4, 0.4, 0.6, 0.6], dtype=np.float32))
+        reference = SolverMuJoCo(model, disable_contacts=True)
+        shared = SolverMuJoCo(model, disable_contacts=True)
+        names = shared.share_model_fields()
+        self.assertIn("body_mass", names)
+        self.assertNotIn("dof_damping", names)
+        self.assertEqual(shared.mjw_model.body_mass.shape[0], 1)
+        self.assertEqual(shared.mjw_model.dof_damping.shape[0], 3)
+        self.assertEqual(shared.share_model_fields(), names)
+        np.testing.assert_array_equal(shared.mjw_model.dof_damping.numpy(), reference.mjw_model.dof_damping.numpy())
+        before = shared.mjw_model.dof_damping.numpy().copy()
+        model.joint_damping.fill_(0.8)
+        with self.assertRaisesRegex(RuntimeError, "immutable shared properties"):
+            shared.notify_model_changed(ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+        np.testing.assert_array_equal(shared.mjw_model.dof_damping.numpy(), before)
+        # The default storage remains authorable; restore its published damping for the trajectory comparison.
+        reference.notify_model_changed(ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+        np.testing.assert_allclose(reference.mjw_model.dof_damping.numpy(), 0.8)
+        model.joint_damping.assign(before.reshape(-1))
+        reference.notify_model_changed(ModelFlags.JOINT_DOF_FORCE_PROPERTIES)
+        control = model.control()
+        control.joint_target_q.fill_(0.2)
+        states = [model.state(), model.state()]
+        graphs = []
+        for solver, state in zip((reference, shared), states, strict=True):
+            solver.step(state, state, control, None, 0.005)
+            with wp.ScopedCapture(device=device) as capture:
+                solver.notify_model_changed(ModelFlags.MODEL_PROPERTIES)
+                solver.step(state, state, control, None, 0.005)
+            graphs.append(capture.graph)
+        model.gravity.assign(np.array([[0, 0, -1], [0, 0, -2], [0, 0, -3], [0, 0, 0]], dtype=np.float32))
+        for _ in range(20):
+            for graph in graphs:
+                wp.capture_launch(graph)
+        np.testing.assert_allclose(states[0].joint_q.numpy(), states[1].joint_q.numpy(), atol=1e-6)
+        np.testing.assert_allclose(states[0].joint_qd.numpy(), states[1].joint_qd.numpy(), atol=1e-6)
+        np.testing.assert_array_equal(shared.mjw_model.opt.gravity.numpy(), model.gravity.numpy()[:3])
+        mask = wp.array([False, True, False, False], dtype=wp.bool, device=device)
+        for solver, state in zip((reference, shared), states, strict=True):
+            solver.reset(state, world_mask=mask)
+        for graph in graphs:
+            wp.capture_launch(graph)
+        np.testing.assert_allclose(states[0].joint_q.numpy(), states[1].joint_q.numpy(), atol=1e-6)
+        np.testing.assert_allclose(states[0].joint_qd.numpy(), states[1].joint_qd.numpy(), atol=1e-6)
+        with wp.ScopedCapture(device=device):
+            with self.assertRaisesRegex(RuntimeError, "before CUDA graph capture"):
+                shared.share_model_fields()
+            with self.assertRaisesRegex(RuntimeError, "immutable shared properties"):
+                shared.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
+            wp.copy(states[0].joint_q, states[1].joint_q)
+
+    def test_shared_shape_fields_allow_inertial_randomization(self):
+        """Keep unrelated inertia authoring functional after sharing immutable shape fields."""
+        if not wp.is_cuda_available():
+            self.skipTest("MuJoCo Warp storage test requires CUDA")
+        model = _make_model(worlds=3, device="cuda:0", shapes=True)
+        solver = SolverMuJoCo(model)
+        names = solver.share_model_fields(ModelFlags.SHAPE_PROPERTIES)
+        self.assertIn("geom_friction", names)
+        self.assertNotIn("body_mass", names)
+        model.body_mass.assign(np.array([1, 1, 2, 2, 3, 3], dtype=np.float32))
+        solver.notify_model_changed(ModelFlags.BODY_INERTIAL_PROPERTIES)
+        np.testing.assert_allclose(solver.mjw_model.body_mass.numpy()[:, 1:], [[1, 1], [2, 2], [3, 3]])
+        self.assertEqual(solver.mjw_model.geom_friction.shape[0], 1)
+        with self.assertRaisesRegex(RuntimeError, "immutable shared properties"):
+            solver.notify_model_changed(ModelFlags.SHAPE_PROPERTIES)
+        with self.assertRaisesRegex(RuntimeError, "immutable shared properties"):
+            solver.notify_model_changed(ModelFlags.SHAPE_TYPE_AND_SOURCE)
+
     def test_inertial_and_reference_updates_preserve_pending_limit_parameters(self):
         """Recompute limits from published parameters until a force notification arrives."""
         for cpu in (True, False):
