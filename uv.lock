@@ -3258,7 +3258,7 @@ wheels = [
 [[package]]
 name = "mujoco-warp"
 version = "3.17.0"
-source = { registry = "https://pypi.org/simple" }
+source = { git = "https://github.com/StafaH/mujoco_warp.git?rev=656b366be0fed16f4fc6daf7ed199d4f2b957417#656b366be0fed16f4fc6daf7ed199d4f2b957417" }
 dependencies = [
     { name = "absl-py" },
     { name = "etils", version = "1.13.0", source = { registry = "https://pypi.org/simple" }, extra = ["epath"], marker = "python_full_version < '3.11'" },
@@ -3268,10 +3268,6 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "warp-lang" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c3/82/846dc011598bcb3e6ea8949c1fc7519584a86241b50c62fab4e631519200/mujoco_warp-3.17.0.tar.gz", hash = "sha256:2a5391f9d4d7a4d0e2908e0be80ee77ad12dbf27c76a2b9724099441360b5de7", size = 2266308, upload-time = "2026-10-22T23:39:12.206Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/df/81/f651b9f3ee97786f375c879c2386734da1d0aba257b654c6c181edb824fd/mujoco_warp-3.17.0-py3-none-any.whl", hash = "sha256:3c7d4a6c27e60c61679d3746c6fa32e55803d22dd2f3faf79bcc3b643d61ae0a", size = 2348047, upload-time = "2026-10-22T23:39:10.383Z" },
 ]
 
 [[package]]
@@ -3939,7 +3935,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'examples'", specifier = ">=3.10.7" },
     { name = "meshio", marker = "extra == 'importers'", specifier = ">=5.3.5" },
     { name = "mujoco", marker = "(platform_machine != 'ARM64' and extra == 'sim') or (sys_platform != 'win32' and extra == 'sim')", specifier = "~=3.17.0" },
-    { name = "mujoco-warp", marker = "(platform_machine != 'ARM64' and extra == 'sim') or (sys_platform != 'win32' and extra == 'sim')", specifier = "~=3.17.0" },
+    { name = "mujoco-warp", marker = "(platform_machine != 'ARM64' and extra == 'sim') or (sys_platform != 'win32' and extra == 'sim')", git = "https://github.com/StafaH/mujoco_warp.git?rev=656b366be0fed16f4fc6daf7ed199d4f2b957417" },
     { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=3.0.1" },
     { name = "nbsphinx", marker = "extra == 'docs'", specifier = ">=0.9.0" },
     { name = "networkx", marker = "extra == 'examples'", specifier = ">=2.6" },

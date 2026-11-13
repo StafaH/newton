@@ -166,6 +166,8 @@ conflicts = [
 
 [tool.uv.sources]
 warp-lang = { index = "nvidia" }
+# MuJoCo Warp 3.17.0 with per-world tree sleep policies, for heterogeneous worlds.
+mujoco-warp = { git = "https://github.com/StafaH/mujoco_warp.git", rev = "656b366be0fed16f4fc6daf7ed199d4f2b957417" }
 torch = [
     { index = "pytorch-cu128", extra = "torch-cu12" },
     { index = "pytorch-cu130", extra = "torch-cu13" },
