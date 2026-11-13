@@ -5387,7 +5387,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 # reset on the next step. Otherwise push it now so it is not
                 # lost before the next sync. The sleeping path synchronizes
                 # below before rebuilding its cached data.
-                if self._update_data_interval != 1 and not self.enable_sleeping:
+                if self._update_data_interval != 1 and (not self.enable_sleeping or self._sleep_static):
                     data = self.mj_data if self.use_mujoco_cpu else self.mjw_data
                     if data is not None and native_template_world_selected:
                         self._update_mjc_data(data, self.model, state, world_mask=world_mask)
@@ -5422,7 +5422,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             inputs=[world_mask, *buffers],
             device=self.model.device,
         )
-        if self.enable_sleeping:
+        if self._sleep_static:
+            # No tree sleeps that the next step would leave at its old coordinates.
+            self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
+        elif self.enable_sleeping:
             self._update_mjc_data(d, self.model, state, world_mask=world_mask)
             self._wake_sleeping_worlds(world_mask, clear_overflow=True)
             # Sleeping trees retain derived state, so rebuild it at the reset
@@ -6346,7 +6349,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         mjw_data = getattr(self, "mjw_data", None)
         jnt_mocap = self._jnt_mocap if mjw_data is not None else None
-        sleep_redirect = is_mjwarp and self.enable_sleeping and write_state
+        # With a static sleep state, an edit wakes no tree, so there is none to detect.
+        sleep_redirect = is_mjwarp and self.enable_sleeping and not self._sleep_static and write_state
         mocap_root_moved = self._mocap_root_moved if is_mjwarp and jnt_mocap is not None else None
         if mocap_root_moved is not None:
             mocap_root_moved.zero_()
