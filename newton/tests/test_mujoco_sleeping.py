@@ -109,6 +109,53 @@ def _build_selective_wake_model() -> newton.Model:
     return builder.finalize()
 
 
+def _build_heterogeneous_model(variants: list[str], active: list[int]) -> newton.Model:
+    """Build worlds that hold the named variants and simulate one each, over a ground plane."""
+    pendulum = newton.ModelBuilder()
+    SolverMuJoCo.register_custom_attributes(pendulum)
+    links, joints = [], []
+    for index in range(2):
+        link = pendulum.add_link(xform=wp.transform((0.5 * index, 0.0, 1.0), wp.quat_identity()), mass=1.0)
+        pendulum.add_shape_box(body=link, hx=0.25, hy=0.04, hz=0.04)
+        links.append(link)
+        joints.append(
+            pendulum.add_joint_revolute(
+                parent=-1 if index == 0 else links[index - 1],
+                child=link,
+                axis=(0.0, 1.0, 0.0),
+                parent_xform=wp.transform((-0.25, 0.0, 1.0) if index == 0 else (0.25, 0.0, 0.0), wp.quat_identity()),
+                child_xform=wp.transform((-0.25, 0.0, 0.0), wp.quat_identity()),
+            )
+        )
+    pendulum.add_articulation(joints)
+
+    # The box rests where the pendulum swings, so a collision between the two would show.
+    box = newton.ModelBuilder()
+    SolverMuJoCo.register_custom_attributes(box)
+    body = box.add_body(xform=wp.transform((0.3, 0.0, 0.4), wp.quat_identity()), mass=2.0)
+    box.add_shape_box(body=body, hx=0.1, hy=0.1, hz=0.1)
+
+    builders = {"pendulum": pendulum, "box": box}
+    scene = newton.ModelBuilder()
+    SolverMuJoCo.register_custom_attributes(scene)
+    scene.add_ground_plane()
+    for index in active:
+        SolverMuJoCo.add_heterogeneous_world(scene, [builders[name] for name in variants], active=index)
+    return scene.finalize()
+
+
+def _simulate_heterogeneous(model: newton.Model, steps: int = 150):
+    """Step the model and return the solver, the state and the joint coordinates of every step."""
+    solver = SolverMuJoCo(model, njmax=50, nconmax=20)
+    state, control = model.state(), model.control()
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+    joint_q = []
+    for _ in range(steps):
+        solver.step(state, state, control, None, 2.0e-3)
+        joint_q.append(state.joint_q.numpy().reshape(model.world_count, -1))
+    return solver, state, np.stack(joint_q)
+
+
 class TestMuJoCoSleeping(unittest.TestCase):
     def _make_sim(self, *, world_count: int = 1, **solver_kwargs):
         model = _build_sleep_model(world_count)
@@ -235,7 +282,7 @@ class TestMuJoCoSleeping(unittest.TestCase):
             ],
         )
         np.testing.assert_array_equal(
-            solver.mjw_model.tree_sleep_policy.numpy(),
+            solver.mjw_model.tree_sleep_policy.numpy().reshape(-1),
             [
                 mujoco_policy.mjSLEEP_AUTO_ALLOWED,
                 mujoco_policy.mjSLEEP_AUTO_NEVER,
@@ -465,6 +512,35 @@ class TestMuJoCoSleeping(unittest.TestCase):
         np.testing.assert_array_equal(solver.mjw_data.tree_asleep.numpy()[0] < 0, [True, True, False])
         self.assertEqual(int(solver.mjw_data.nv_awake.numpy()[0]), 2)
         np.testing.assert_array_equal(solver.mjw_data.overflow.numpy(), [0])
+
+    def test_heterogeneous_worlds_match_variants_simulated_alone(self):
+        model = _build_heterogeneous_model(["pendulum", "box"], active=[0, 1])
+        solver, state, joint_q = _simulate_heterogeneous(model)
+        _, _, pendulum_q = _simulate_heterogeneous(_build_heterogeneous_model(["pendulum"], active=[0]))
+        _, _, box_q = _simulate_heterogeneous(_build_heterogeneous_model(["box"], active=[0]))
+
+        # The solver sizes its compact space for the larger variant, not for both.
+        self.assertEqual(solver.nvmax, 6)
+        self.assertGreater(np.abs(pendulum_q[-1] - pendulum_q[0]).max(), 0.5)
+        np.testing.assert_allclose(joint_q[:, 0, :2], pendulum_q[:, 0], atol=1.0e-5)
+        np.testing.assert_allclose(joint_q[:, 1, 2:], box_q[:, 0], atol=1.0e-5)
+        np.testing.assert_array_equal(joint_q[:, 0, 2:], np.broadcast_to(joint_q[0, 0, 2:], joint_q[:, 0, 2:].shape))
+        np.testing.assert_array_equal(joint_q[:, 1, :2], np.zeros_like(joint_q[:, 1, :2]))
+
+        # Neither a write to an always-asleep tree nor a reset wakes it.
+        moved = state.joint_q.numpy()
+        moved[2] += 0.1
+        state.joint_q.assign(moved)
+        solver.step(state, state, model.control(), None, 2.0e-3)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 0], [0, 1]])
+        solver.reset(state)
+        np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 0], [0, 1]])
+        np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [2, 6])
+
+    def test_always_asleep_requires_sleeping(self):
+        model = _build_heterogeneous_model(["pendulum", "box"], active=[0, 1])
+        with self.assertRaisesRegex(ValueError, "requires sleeping"):
+            SolverMuJoCo(model, enable_sleeping=False)
 
     def test_sleeping_step_and_reset_support_cuda_graph_capture(self):
         model, solver, state_0, state_1, control, contacts = self._make_sim(enable_sleeping=True, nvmax=1)

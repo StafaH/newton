@@ -11,7 +11,7 @@ import re
 import sys
 import warnings
 from array import array
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
@@ -21,7 +21,7 @@ import numpy as np
 import warp as wp
 
 from ...core._warnings import _external_warning_stacklevel
-from ...core.types import MAXVAL, Axis, override, vec5, vec10
+from ...core.types import MAXVAL, Axis, Transform, override, vec5, vec10
 from ...exceptions import NewtonDeprecationWarning, NewtonWarning
 from ...geometry import GeoType, Mesh, ShapeFlags
 from ...sim import (
@@ -897,6 +897,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         """Allow the tree to sleep."""
         INIT = 5
         """Initialize the tree asleep."""
+        ALWAYS = 6
+        """Keep the tree asleep: it does not move, collide or constrain, and nothing wakes it.
+
+        Unlike the other policies, this one may differ between worlds, which gives heterogeneous
+        worlds: add every variant to every world and keep all but one asleep in each. Set it on
+        the root body of a tree. It needs sleeping, which the solver enables when it finds the
+        policy.
+        """
 
     # Class variables to cache the imported modules
     _mujoco = None
@@ -1008,7 +1016,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
     @staticmethod
     def _parse_sleep_policy(value: str | int, context: dict[str, Any] | None = None) -> int:
-        """Parse body sleep policy: auto=0, never=3, allowed=4, init=5."""
+        """Parse body sleep policy: auto=0, never=3, allowed=4, init=5, always=6."""
         return SolverMuJoCo._parse_named_int(
             value,
             {
@@ -1016,6 +1024,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 "never": SolverMuJoCo.SleepPolicy.NEVER,
                 "allowed": SolverMuJoCo.SleepPolicy.ALLOWED,
                 "init": SolverMuJoCo.SleepPolicy.INIT,
+                "always": SolverMuJoCo.SleepPolicy.ALWAYS,
             },
         )
 
@@ -1467,6 +1476,67 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     owner = slider_owners.pop() if len(slider_owners) == 1 else -1
             owners.append(owner)
         return owners
+
+    @classmethod
+    def set_always_asleep(cls, builder: ModelBuilder, bodies: Iterable[int]) -> None:
+        """Keep bodies of a builder always asleep and hide their shapes.
+
+        The bodies get :attr:`SleepPolicy.ALWAYS`, which takes effect on the root body of each
+        kinematic tree, so pass every body of the trees to put to sleep.
+
+        Args:
+            builder: Builder with the attributes of :meth:`register_custom_attributes`.
+            bodies: Indices of the bodies in ``builder``.
+        """
+        attribute = builder.custom_attributes.get("mujoco:sleep_policy")
+        if attribute is None:
+            raise ValueError("Call SolverMuJoCo.register_custom_attributes() on the builder first.")
+        if attribute.values is None:
+            attribute.values = {}
+        bodies = set(bodies)
+        for body in bodies:
+            attribute.values[body] = int(cls.SleepPolicy.ALWAYS)
+        for shape, body in enumerate(builder.shape_body):
+            if body in bodies:
+                builder.shape_flags[shape] &= ~int(ShapeFlags.VISIBLE)
+
+    @classmethod
+    def add_heterogeneous_world(
+        cls,
+        builder: ModelBuilder,
+        variants: Sequence[ModelBuilder],
+        active: int,
+        xform: Transform | None = None,
+    ) -> None:
+        """Add a world that simulates one of several variants.
+
+        The solver needs worlds of one structure, so the world holds every variant and keeps all
+        but ``variants[active]`` always asleep with :meth:`set_always_asleep`. Worlds added with
+        the same variants and a different ``active`` then differ in what they simulate::
+
+            scene = newton.ModelBuilder()
+            SolverMuJoCo.register_custom_attributes(scene)
+            for world in range(world_count):
+                SolverMuJoCo.add_heterogeneous_world(scene, [quadruped, humanoid], active=world % 2)
+
+        Every world keeps the bodies, joints and shapes of every variant, in the order of
+        ``variants``, so states and controls have one layout in all worlds.
+
+        Args:
+            builder: Builder to add the world to, with the attributes of :meth:`register_custom_attributes`.
+            variants: Builders of the variants.
+            active: Index of the variant that this world simulates.
+            xform: Transform applied to the root bodies of every variant.
+        """
+        if not 0 <= active < len(variants):
+            raise ValueError(f"active must index one of the {len(variants)} variants, got {active}.")
+        builder.begin_world()
+        for index, variant in enumerate(variants):
+            first_body = builder.body_count
+            builder.add_builder(variant, xform=xform)
+            if index != active:
+                cls.set_always_asleep(builder, range(first_body, builder.body_count))
+        builder.end_world()
 
     @override
     @classmethod
@@ -4552,14 +4622,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # Import and cache MuJoCo modules (only happens once per class)
         mujoco, _ = self.import_mujoco()
         mujoco_attrs = getattr(model, "mujoco", None)
+        always_asleep = False
+        if mujoco_attrs is not None and hasattr(mujoco_attrs, "sleep_policy"):
+            always_asleep = bool(np.any(mujoco_attrs.sleep_policy.numpy() == self.SleepPolicy.ALWAYS))
         if enable_sleeping is None:
-            if mujoco_attrs is not None and hasattr(mujoco_attrs, "enable_sleeping"):
+            if always_asleep:
+                enable_sleeping = True
+            elif mujoco_attrs is not None and hasattr(mujoco_attrs, "enable_sleeping"):
                 enable_sleeping = bool(mujoco_attrs.enable_sleeping.numpy()[0])
             else:
                 enable_sleeping = False
         elif not isinstance(enable_sleeping, bool | np.bool_):
             raise TypeError(f"enable_sleeping must be a bool or None, got {type(enable_sleeping).__name__}.")
         enable_sleeping = bool(enable_sleeping)
+        if always_asleep and not enable_sleeping:
+            raise ValueError("SleepPolicy.ALWAYS requires sleeping (enable_sleeping=True or None).")
         if enable_sleeping and use_mujoco_cpu:
             raise ValueError("enable_sleeping=True requires the MuJoCo Warp GPU backend (use_mujoco_cpu=False).")
         if enable_sleeping and not use_mujoco_contacts:
@@ -4592,14 +4669,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._sleep_qpos: wp.array2d[wp.float32] | None = None
         self._sleep_qpos_treeid: wp.array[wp.int32] | None = None
         self._sleep_tree_changed: wp.array2d[wp.int32] | None = None
-        self._initial_tree_asleep: wp.array[wp.int32] | None = None
-        self._initial_tree_awake: wp.array[wp.int32] | None = None
-        self._initial_body_awake: wp.array[wp.int32] | None = None
-        self._initial_body_awake_ind: wp.array[wp.int32] | None = None
-        self._initial_dof_awake_ind: wp.array[wp.int32] | None = None
-        self._initial_ntree_awake = 0
-        self._initial_nbody_awake = 0
-        self._initial_nv_awake = 0
+        self._initial_tree_asleep: wp.array2d[wp.int32] | None = None
+        self._initial_tree_awake: wp.array2d[wp.int32] | None = None
+        self._initial_body_awake: wp.array2d[wp.int32] | None = None
+        self._initial_body_awake_ind: wp.array2d[wp.int32] | None = None
+        self._initial_dof_awake_ind: wp.array2d[wp.int32] | None = None
+        self._initial_ntree_awake: wp.array[wp.int32] | None = None
+        self._initial_nbody_awake: wp.array[wp.int32] | None = None
+        self._initial_nv_awake: wp.array[wp.int32] | None = None
         self._initial_model_sync = True
         self._deterministic = deterministic if deterministic is not None else wp.config.deterministic
         self._strict_capacity = strict_capacity
@@ -5352,40 +5429,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._restore_initial_sleeping_state(world_mask, clear_overflow=True)
 
     def _capture_initial_sleeping_state(self) -> None:
-        """Capture the template world's initial sleep bookkeeping."""
+        """Capture the initial sleep bookkeeping of every world."""
         if not self.enable_sleeping or self.mjw_data is None:
             return
 
         d = self.mjw_data
-        device = self.model.device
-        self._initial_tree_asleep = wp.array(
-            d.tree_asleep.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_tree_awake = wp.array(
-            d.tree_awake.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_body_awake = wp.array(
-            d.body_awake.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_body_awake_ind = wp.array(
-            d.body_awake_ind.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_dof_awake_ind = wp.array(
-            d.dof_awake_ind.numpy()[0].copy(),
-            dtype=wp.int32,
-            device=device,
-        )
-        self._initial_ntree_awake = int(d.ntree_awake.numpy()[0])
-        self._initial_nbody_awake = int(d.nbody_awake.numpy()[0])
-        self._initial_nv_awake = int(d.nv_awake.numpy()[0])
+        self._initial_tree_asleep = wp.clone(d.tree_asleep)
+        self._initial_tree_awake = wp.clone(d.tree_awake)
+        self._initial_body_awake = wp.clone(d.body_awake)
+        self._initial_body_awake_ind = wp.clone(d.body_awake_ind)
+        self._initial_dof_awake_ind = wp.clone(d.dof_awake_ind)
+        self._initial_ntree_awake = wp.clone(d.ntree_awake)
+        self._initial_nbody_awake = wp.clone(d.nbody_awake)
+        self._initial_nv_awake = wp.clone(d.nv_awake)
 
     def _restore_initial_sleeping_state(
         self,
@@ -5434,6 +5490,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
+    def _tree_sleep_policy(self) -> wp.array2d[wp.int32]:
+        """Return MuJoCo Warp's sleep policy of every tree, one row per world or one for all."""
+        policy = self.mjw_model.tree_sleep_policy
+        return policy if policy.ndim == 2 else policy.reshape((1, -1))
+
     def _wake_sleeping_worlds(
         self,
         world_mask: wp.array[wp.bool] | None = None,
@@ -5461,9 +5522,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._sleep_awake_value,
                 int(self._mujoco.mjtSleepState.mjS_STATIC),
                 int(self._mujoco.mjtSleepState.mjS_AWAKE),
+                int(self._mujoco.mjtSleepState.mjS_ASLEEP),
+                int(self.SleepPolicy.ALWAYS),
                 m.body_rootid,
                 m.body_mocapid,
                 m.body_treeid,
+                self._tree_sleep_policy(),
                 d.tree_asleep,
                 d.tree_awake,
                 d.body_awake,
@@ -6335,6 +6399,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     self._sleep_tree_changed,
                     self.mjw_model.ntree,
                     self._sleep_awake_value,
+                    int(self.SleepPolicy.ALWAYS),
+                    self._tree_sleep_policy(),
                 ],
                 outputs=[self.mjw_data.tree_asleep],
                 device=model.device,
@@ -8236,7 +8302,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             body_kwargs["simple"] = 0
             if body_gravcomp is not None and body_gravcomp[child] != 0.0:
                 body_kwargs["gravcomp"] = float(body_gravcomp[child])
-            if body_sleep_policy is not None and body_sleep_policy[child] != self.SleepPolicy.AUTO:
+            # SleepPolicy.ALWAYS is applied per world after compilation.
+            if body_sleep_policy is not None and body_sleep_policy[child] not in (
+                self.SleepPolicy.AUTO,
+                self.SleepPolicy.ALWAYS,
+            ):
                 body_kwargs["sleep"] = int(body_sleep_policy[child])
             if mass > 0.0:
                 body_kwargs["mass"] = mass
@@ -9329,6 +9399,20 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             mjc_body_to_newton_np = self._tile_world_mapping(body_to_newton_template, nworld, bodies_per_world)
             self.mjc_body_to_newton = wp.array(mjc_body_to_newton_np, dtype=wp.int32)
 
+            # A tree is always asleep in the worlds whose root body has SleepPolicy.ALWAYS.
+            tree_always_asleep = None
+            if body_sleep_policy is not None and np.any(body_sleep_policy == self.SleepPolicy.ALWAYS):
+                if not hasattr(getattr(mujoco_warp, "SleepPolicy", None), "ALWAYS"):
+                    raise RuntimeError(
+                        "SleepPolicy.ALWAYS requires a MuJoCo Warp with per-world tree sleep policies "
+                        "(https://github.com/google-deepmind/mujoco_warp/pull/1680)."
+                    )
+                tree_root = mjc_body_to_newton_np[:, self.mj_model.tree_bodyadr]
+                tree_always_asleep = body_sleep_policy[tree_root] == self.SleepPolicy.ALWAYS
+                tree_sleep_policy = np.tile(self.mjw_model.tree_sleep_policy.numpy()[:1], (nworld, 1))
+                tree_sleep_policy[tree_always_asleep] = int(mujoco_warp.SleepPolicy.ALWAYS)
+                self.mjw_model.tree_sleep_policy = wp.array(tree_sleep_policy, dtype=int)
+
             # Common variables for mapping creation
             njnt = self.mj_model.njnt
             joints_per_world = model.joint_count // model.world_count
@@ -9626,14 +9710,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     + int(self.mj_model.ten_J_rownnz.sum())
                 )
 
+            if nvmax is None and tree_always_asleep is not None:
+                # Trees that are always asleep never need room: size for the world with the most other trees.
+                nvmax = int(np.max(np.sum(self.mj_model.tree_dofnum * ~tree_always_asleep, axis=1)))
             if nvmax is not None:
                 if nvmax > self.mj_model.nv:
                     raise ValueError(f"nvmax must not exceed the model's {self.mj_model.nv} degrees of freedom.")
                 sleeping_enabled = bool(enableflags & mujoco.mjtEnableBit.mjENBL_SLEEP)
                 if not sleeping_enabled:
                     raise ValueError("nvmax is only supported when sleeping is enabled.")
-                initially_awake = self.mj_data.tree_asleep < 0
-                minimum_nvmax = int(np.sum(self.mj_model.tree_dofnum[initially_awake]))
+                initially_awake = np.tile(self.mj_data.tree_asleep < 0, (nworld, 1))
+                if tree_always_asleep is not None:
+                    initially_awake &= ~tree_always_asleep
+                minimum_nvmax = int(np.max(np.sum(self.mj_model.tree_dofnum * initially_awake, axis=1)))
                 if nvmax < minimum_nvmax:
                     raise ValueError(
                         f"nvmax={nvmax} is too small: the initial state has {minimum_nvmax} awake degrees of freedom."
@@ -9652,6 +9741,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     nvmax=nvmax,
                 )
             self.nvmax = self.mjw_data.nvmax
+            if tree_always_asleep is not None:
+                from mujoco_warp._src.sleep import update_sleep
+
+                # An always-asleep tree forms a sleep cycle of its own.
+                tree_asleep = self.mjw_data.tree_asleep.numpy()
+                tree_asleep[tree_always_asleep] = np.nonzero(tree_always_asleep)[1]
+                self.mjw_data.tree_asleep.assign(tree_asleep)
+                update_sleep(self.mjw_model, self.mjw_data)
             if self.enable_sleeping:
                 self._capture_initial_sleeping_state()
                 self._sleep_qpos = wp.empty_like(self.mjw_data.qpos)

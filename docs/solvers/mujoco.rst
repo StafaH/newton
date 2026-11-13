@@ -1124,6 +1124,40 @@ and `MuJoCo Warp compact-solver guide
 <https://mujoco.readthedocs.io/en/latest/mjwarp/#compact-solver>`_ for the
 underlying sleep policy, wake triggers, and ``nvmax`` tuning guidance.
 
+Heterogeneous worlds
+--------------------
+
+The solver simulates worlds of one structure: every world needs the same
+bodies, joints, and shapes. Worlds that simulate different things are built
+as the same union of variants, of which each world simulates one and keeps
+the others asleep with
+:attr:`~newton.solvers.SolverMuJoCo.SleepPolicy.ALWAYS`. A tree with this
+policy does not move, collide, or constrain, nothing wakes it, and it takes
+no room in the compact solver. Unlike the other policies, it may differ
+between worlds.
+:meth:`~newton.solvers.SolverMuJoCo.add_heterogeneous_world` adds such a
+world::
+
+    scene = newton.ModelBuilder()
+    SolverMuJoCo.register_custom_attributes(scene)
+    scene.add_ground_plane()
+    for world in range(world_count):
+        SolverMuJoCo.add_heterogeneous_world(scene, [quadruped, humanoid], active=world % 2)
+
+    solver = SolverMuJoCo(scene.finalize())
+
+Every world holds the bodies, joints, and shapes of every variant, so states
+and controls keep one layout in all worlds, and an
+:class:`~newton.selection.ArticulationView` of a variant spans all worlds,
+including those where it sleeps. The shapes of a sleeping variant are hidden.
+:meth:`~newton.solvers.SolverMuJoCo.set_always_asleep` marks bodies of a
+builder directly, for worlds that are composed by other means.
+
+The policy enables sleeping, with the requirements listed above, and by
+default sizes ``nvmax`` for the world with the most degrees of freedom that
+are not always asleep. It needs a MuJoCo Warp with per-world tree sleep
+policies.
+
 
 .. _mujoco-custom-attributes:
 

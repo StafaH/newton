@@ -1,0 +1,1 @@
+Add heterogeneous worlds to `SolverMuJoCo`: `SolverMuJoCo.SleepPolicy.ALWAYS` keeps a kinematic tree asleep and may differ between worlds, and `SolverMuJoCo.add_heterogeneous_world()` adds a world that holds several variants and simulates one of them.
