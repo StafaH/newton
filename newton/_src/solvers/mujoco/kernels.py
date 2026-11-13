@@ -3464,9 +3464,12 @@ def reset_sleeping_state_kernel(
     awake_value: int,
     sleep_state_static: int,
     sleep_state_awake: int,
+    sleep_state_asleep: int,
+    sleep_policy_always: int,
     body_rootid: wp.array[wp.int32],
     body_mocapid: wp.array[wp.int32],
     body_treeid: wp.array[wp.int32],
+    tree_sleep_policy: wp.array2d[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
     tree_awake: wp.array2d[wp.int32],
     body_awake: wp.array2d[wp.int32],
@@ -3477,22 +3480,34 @@ def reset_sleeping_state_kernel(
     nv_awake: wp.array[wp.int32],
     overflow: wp.array[wp.int32],
 ):
-    """Wake every tree and rebuild sleep bookkeeping in selected worlds."""
+    """Wake every tree and rebuild sleep bookkeeping in selected worlds.
+
+    Trees with the policy ``sleep_policy_always`` stay asleep. The lists of awake bodies and
+    degrees of freedom still hold every element; MuJoCo Warp compacts them in its next update.
+    """
     worldid, elemid = wp.tid()
     if world_mask and not world_mask[worldid]:
         return
 
+    policy_worldid = worldid % tree_sleep_policy.shape[0]
     if elemid < ntree:
-        tree_asleep[worldid, elemid] = awake_value
-        tree_awake[worldid, elemid] = 1
+        if tree_sleep_policy[policy_worldid, elemid] == sleep_policy_always:
+            tree_asleep[worldid, elemid] = elemid
+            tree_awake[worldid, elemid] = 0
+        else:
+            tree_asleep[worldid, elemid] = awake_value
+            tree_awake[worldid, elemid] = 1
 
     if elemid < nbody:
-        if body_treeid[elemid] < 0:
+        treeid = body_treeid[elemid]
+        if treeid < 0:
             rootid = body_rootid[elemid]
             if body_mocapid[rootid] < 0:
                 body_awake[worldid, elemid] = sleep_state_static
             else:
                 body_awake[worldid, elemid] = sleep_state_awake
+        elif tree_sleep_policy[policy_worldid, treeid] == sleep_policy_always:
+            body_awake[worldid, elemid] = sleep_state_asleep
         else:
             body_awake[worldid, elemid] = sleep_state_awake
         body_awake_ind[worldid, elemid] = elemid
@@ -3515,14 +3530,14 @@ def restore_sleeping_state_kernel(
     nv: int,
     nbody: int,
     ntree: int,
-    initial_ntree_awake: int,
-    initial_nbody_awake: int,
-    initial_nv_awake: int,
-    initial_tree_asleep: wp.array[wp.int32],
-    initial_tree_awake: wp.array[wp.int32],
-    initial_body_awake: wp.array[wp.int32],
-    initial_body_awake_ind: wp.array[wp.int32],
-    initial_dof_awake_ind: wp.array[wp.int32],
+    initial_ntree_awake: wp.array[wp.int32],
+    initial_nbody_awake: wp.array[wp.int32],
+    initial_nv_awake: wp.array[wp.int32],
+    initial_tree_asleep: wp.array2d[wp.int32],
+    initial_tree_awake: wp.array2d[wp.int32],
+    initial_body_awake: wp.array2d[wp.int32],
+    initial_body_awake_ind: wp.array2d[wp.int32],
+    initial_dof_awake_ind: wp.array2d[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
     tree_awake: wp.array2d[wp.int32],
     body_awake: wp.array2d[wp.int32],
@@ -3539,20 +3554,20 @@ def restore_sleeping_state_kernel(
         return
 
     if elemid < ntree:
-        tree_asleep[worldid, elemid] = initial_tree_asleep[elemid]
-        tree_awake[worldid, elemid] = initial_tree_awake[elemid]
+        tree_asleep[worldid, elemid] = initial_tree_asleep[worldid, elemid]
+        tree_awake[worldid, elemid] = initial_tree_awake[worldid, elemid]
 
     if elemid < nbody:
-        body_awake[worldid, elemid] = initial_body_awake[elemid]
-        body_awake_ind[worldid, elemid] = initial_body_awake_ind[elemid]
+        body_awake[worldid, elemid] = initial_body_awake[worldid, elemid]
+        body_awake_ind[worldid, elemid] = initial_body_awake_ind[worldid, elemid]
 
     if elemid < nv:
-        dof_awake_ind[worldid, elemid] = initial_dof_awake_ind[elemid]
+        dof_awake_ind[worldid, elemid] = initial_dof_awake_ind[worldid, elemid]
 
     if elemid == 0:
-        ntree_awake[worldid] = initial_ntree_awake
-        nbody_awake[worldid] = initial_nbody_awake
-        nv_awake[worldid] = initial_nv_awake
+        ntree_awake[worldid] = initial_ntree_awake[worldid]
+        nbody_awake[worldid] = initial_nbody_awake[worldid]
+        nv_awake[worldid] = initial_nv_awake[worldid]
         if clear_overflow:
             overflow[worldid] = 0
 
@@ -3583,16 +3598,22 @@ def wake_changed_trees_kernel(
     tree_changed: wp.array2d[wp.int32],
     ntree: int,
     awake_value: int,
+    sleep_policy_always: int,
+    tree_sleep_policy: wp.array2d[wp.int32],
     tree_asleep: wp.array2d[wp.int32],
 ):
-    """Wake edited trees and every tree in their sleeping-island cycles."""
+    """Wake edited trees and every tree in their sleeping-island cycles, except always-asleep trees."""
     # Negative values mean awake; non-negative values link the next tree in a
     # sleeping-island cycle. The O(ntree) scan intentionally uses one walker
     # per world because parallel walkers for overlapping edits could overwrite
     # a link before a peer reads it.
     worldid = wp.tid()
+    policy_worldid = worldid % tree_sleep_policy.shape[0]
     for treeid in range(ntree):
         if tree_changed[worldid, treeid] == 0:
+            continue
+        # An always-asleep tree is a cycle of its own, so no other cycle reaches it.
+        if tree_sleep_policy[policy_worldid, treeid] == sleep_policy_always:
             continue
 
         asleep_value = tree_asleep[worldid, treeid]
