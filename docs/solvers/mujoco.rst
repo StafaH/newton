@@ -1153,10 +1153,12 @@ including those where it sleeps. The shapes of a sleeping variant are hidden.
 :meth:`~newton.solvers.SolverMuJoCo.set_always_asleep` marks bodies of a
 builder directly, for worlds that are composed by other means.
 
-The policy enables sleeping, with the requirements listed above, and by
-default sizes ``nvmax`` for the world with the most degrees of freedom that
-are not always asleep. It needs a MuJoCo Warp with per-world tree sleep
-policies.
+The policy uses the sleeping path of MuJoCo Warp, with the requirements
+listed above, and by default sizes ``nvmax`` for the world with the most
+degrees of freedom that are not always asleep. On its own it lets no other
+tree sleep, and the solver skips the passes that wake trees and put them to
+sleep; set ``enable_sleeping=True`` to also let the other trees sleep. It
+needs a MuJoCo Warp with per-world tree sleep policies.
 
 
 .. _mujoco-custom-attributes:

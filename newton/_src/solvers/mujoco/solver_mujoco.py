@@ -902,8 +902,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         Unlike the other policies, this one may differ between worlds, which gives heterogeneous
         worlds: add every variant to every world and keep all but one asleep in each. Set it on
-        the root body of a tree. It needs sleeping, which the solver enables when it finds the
-        policy.
+        the root body of a tree. The solver then uses the sleeping path of MuJoCo Warp. Unless
+        sleeping is enabled, no other tree sleeps.
         """
 
     # Class variables to cache the imported modules
@@ -4625,13 +4625,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         always_asleep = False
         if mujoco_attrs is not None and hasattr(mujoco_attrs, "sleep_policy"):
             always_asleep = bool(np.any(mujoco_attrs.sleep_policy.numpy() == self.SleepPolicy.ALWAYS))
+        sleep_static = False
         if enable_sleeping is None:
-            if always_asleep:
-                enable_sleeping = True
-            elif mujoco_attrs is not None and hasattr(mujoco_attrs, "enable_sleeping"):
+            if mujoco_attrs is not None and hasattr(mujoco_attrs, "enable_sleeping"):
                 enable_sleeping = bool(mujoco_attrs.enable_sleeping.numpy()[0])
             else:
                 enable_sleeping = False
+            # SleepPolicy.ALWAYS uses the sleeping path, but on its own lets no other tree sleep.
+            if always_asleep and not enable_sleeping:
+                enable_sleeping = sleep_static = True
         elif not isinstance(enable_sleeping, bool | np.bool_):
             raise TypeError(f"enable_sleeping must be a bool or None, got {type(enable_sleeping).__name__}.")
         enable_sleeping = bool(enable_sleeping)
@@ -4663,6 +4665,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             raise ValueError(f"sleep_tolerance must be finite and non-negative, got {sleep_tolerance}.")
         self.enable_sleeping = enable_sleeping
         """Whether MuJoCo Warp sleeping is enabled."""
+        self._sleep_static = sleep_static
+        """Whether no tree changes its sleep state: those with SleepPolicy.ALWAYS sleep, the others stay awake."""
         self.nvmax = nvmax
         """Maximum number of active degrees of freedom allocated per world."""
         self._sleep_awake_value = -(1 + int(mujoco.mjMINAWAKE))
@@ -5503,6 +5507,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     ) -> None:
         """Wake all dynamic trees in the selected MuJoCo Warp worlds."""
         if not self.enable_sleeping or self.mjw_data is None:
+            return
+        if self._sleep_static and self._initial_tree_asleep is not None:
+            # No tree is asleep that could wake: the sleep state is the initial one.
+            self._restore_initial_sleeping_state(world_mask, clear_overflow=clear_overflow)
             return
 
         m = self.mjw_model
@@ -9412,6 +9420,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 tree_sleep_policy = np.tile(self.mjw_model.tree_sleep_policy.numpy()[:1], (nworld, 1))
                 tree_sleep_policy[tree_always_asleep] = int(mujoco_warp.SleepPolicy.ALWAYS)
                 self.mjw_model.tree_sleep_policy = wp.array(tree_sleep_policy, dtype=int)
+                # MuJoCo Warp then skips the passes that wake trees and put them to sleep.
+                if self._sleep_static and hasattr(self.mjw_model.opt, "sleep_static"):
+                    self.mjw_model.opt.sleep_static = True
 
             # Common variables for mapping creation
             njnt = self.mj_model.njnt

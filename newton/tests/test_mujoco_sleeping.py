@@ -144,9 +144,9 @@ def _build_heterogeneous_model(variants: list[str], active: list[int]) -> newton
     return scene.finalize()
 
 
-def _simulate_heterogeneous(model: newton.Model, steps: int = 150):
+def _simulate_heterogeneous(model: newton.Model, steps: int = 150, enable_sleeping: bool | None = None):
     """Step the model and return the solver, the state and the joint coordinates of every step."""
-    solver = SolverMuJoCo(model, njmax=50, nconmax=20)
+    solver = SolverMuJoCo(model, njmax=50, nconmax=20, enable_sleeping=enable_sleeping)
     state, control = model.state(), model.control()
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     joint_q = []
@@ -536,6 +536,11 @@ class TestMuJoCoSleeping(unittest.TestCase):
         solver.reset(state)
         np.testing.assert_array_equal(solver.mjw_data.tree_awake.numpy(), [[1, 0], [0, 1]])
         np.testing.assert_array_equal(solver.mjw_data.nv_awake.numpy(), [2, 6])
+
+        # With sleeping enabled the other trees may sleep too, and the variants still do not interact.
+        _, _, joint_q = _simulate_heterogeneous(model, enable_sleeping=True)
+        np.testing.assert_allclose(joint_q[:, 0, :2], pendulum_q[:, 0], atol=1.0e-5)
+        np.testing.assert_array_equal(joint_q[:, 1, :2], np.zeros_like(joint_q[:, 1, :2]))
 
     def test_always_asleep_requires_sleeping(self):
         model = _build_heterogeneous_model(["pendulum", "box"], active=[0, 1])
